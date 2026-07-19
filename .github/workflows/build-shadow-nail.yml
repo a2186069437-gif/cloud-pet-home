@@ -1,0 +1,181 @@
+name: Build Shadow Nail Web
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/build-input/**"
+      - ".github/workflows/build-shadow-nail.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: shadow-nail-web
+  cancel-in-progress: true
+
+jobs:
+  export-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct game source
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/shadow-nail-source"
+          cat .github/build-input/source.part* | base64 --decode > "$RUNNER_TEMP/shadow-nail-source.zip"
+          unzip -q "$RUNNER_TEMP/shadow-nail-source.zip" -d "$RUNNER_TEMP/shadow-nail-source"
+          test -s "$RUNNER_TEMP/shadow-nail-source/project.godot"
+          test -s "$RUNNER_TEMP/shadow-nail-source/export_presets.cfg"
+
+      - name: Install Godot 4.7 editor
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/godot"
+          curl --fail --location --retry 3 \
+            "https://godot-releases.nbg1.your-objectstorage.com/4.7-stable/Godot_v4.7-stable_linux.x86_64.zip" \
+            --output "$RUNNER_TEMP/godot-linux.zip"
+          unzip -q "$RUNNER_TEMP/godot-linux.zip" -d "$RUNNER_TEMP/godot"
+          chmod +x "$RUNNER_TEMP/godot/Godot_v4.7-stable_linux.x86_64"
+
+      - name: Install official Web export templates
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import binascii
+          import pathlib
+          import struct
+          import urllib.request
+          import zlib
+
+          url = "https://godot-releases.nbg1.your-objectstorage.com/4.7-stable/Godot_v4.7-stable_export_templates.tpz"
+          archive_size = 1_279_207_690
+          wanted = {
+              "templates/version.txt",
+              "templates/icudt_godot.dat",
+              "templates/web_nothreads_debug.zip",
+              "templates/web_nothreads_release.zip",
+          }
+          destination = pathlib.Path.home() / ".local/share/godot/export_templates/4.7.stable"
+          destination.mkdir(parents=True, exist_ok=True)
+
+          def read_range(start, end):
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "Range": f"bytes={start}-{end}",
+                      "User-Agent": "shadow-nail-github-actions",
+                  },
+              )
+              with urllib.request.urlopen(request, timeout=120) as response:
+                  data = response.read()
+              expected = end - start + 1
+              if len(data) != expected:
+                  raise RuntimeError(f"Range length mismatch: expected {expected}, got {len(data)}")
+              return data
+
+          # 只读取 TPZ 尾部的中央目录，避免下载与 Web 导出无关的桌面/移动模板。
+          tail_size = 262_144
+          tail_start = archive_size - tail_size
+          tail = read_range(tail_start, archive_size - 1)
+          eocd_position = tail.rfind(b"PK\x05\x06")
+          if eocd_position < 0:
+              raise RuntimeError("ZIP end-of-central-directory record not found")
+          eocd = struct.unpack_from("<4s4H2LH", tail, eocd_position)
+          central_size, central_offset = eocd[5], eocd[6]
+          central = read_range(central_offset, central_offset + central_size - 1)
+
+          entries = {}
+          cursor = 0
+          while cursor < len(central):
+              fields = struct.unpack_from("<4s6H3L5H2L", central, cursor)
+              if fields[0] != b"PK\x01\x02":
+                  raise RuntimeError(f"Invalid central-directory signature at {cursor}")
+              method = fields[4]
+              crc32 = fields[7]
+              compressed_size = fields[8]
+              uncompressed_size = fields[9]
+              name_length, extra_length, comment_length = fields[10:13]
+              local_offset = fields[16]
+              name_start = cursor + 46
+              name = central[name_start:name_start + name_length].decode("utf-8")
+              entries[name] = (method, crc32, compressed_size, uncompressed_size, local_offset)
+              cursor = name_start + name_length + extra_length + comment_length
+
+          missing = wanted.difference(entries)
+          if missing:
+              raise RuntimeError(f"Missing templates: {sorted(missing)}")
+
+          for name in sorted(wanted):
+              method, expected_crc, compressed_size, expected_size, local_offset = entries[name]
+              local = read_range(local_offset, local_offset + 29)
+              local_fields = struct.unpack("<4s5H3L2H", local)
+              if local_fields[0] != b"PK\x03\x04":
+                  raise RuntimeError(f"Invalid local header for {name}")
+              local_name_length, local_extra_length = local_fields[9], local_fields[10]
+              data_start = local_offset + 30 + local_name_length + local_extra_length
+              compressed = read_range(data_start, data_start + compressed_size - 1)
+              if method == 0:
+                  data = compressed
+              elif method == 8:
+                  data = zlib.decompress(compressed, -15)
+              else:
+                  raise RuntimeError(f"Unsupported compression method {method} for {name}")
+              if len(data) != expected_size:
+                  raise RuntimeError(f"Uncompressed-size mismatch for {name}")
+              if (binascii.crc32(data) & 0xFFFFFFFF) != expected_crc:
+                  raise RuntimeError(f"CRC mismatch for {name}")
+              output = destination / pathlib.PurePosixPath(name).name
+              output.write_bytes(data)
+              print(f"Installed {output.name} ({len(data)} bytes)")
+          PY
+
+      - name: Export Web build
+        shell: bash
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/shadow-nail-game"
+          mkdir -p "$GITHUB_WORKSPACE/shadow-nail-game"
+          "$RUNNER_TEMP/godot/Godot_v4.7-stable_linux.x86_64" \
+            --headless \
+            --path "$RUNNER_TEMP/shadow-nail-source" \
+            --export-release Web \
+            "$GITHUB_WORKSPACE/shadow-nail-game/index.html"
+          touch "$GITHUB_WORKSPACE/shadow-nail-game/.nojekyll"
+          printf '%s\n' '# Shadow Nail' '' 'Godot 4.7 Web build generated by GitHub Actions.' \
+            > "$GITHUB_WORKSPACE/shadow-nail-game/README.md"
+
+      - name: Verify exported files
+        shell: bash
+        run: |
+          test -s shadow-nail-game/index.html
+          test -s shadow-nail-game/index.js
+          test -s shadow-nail-game/index.pck
+          test -s shadow-nail-game/index.wasm
+          python3 - <<'PY'
+          from pathlib import Path
+          wasm = Path("shadow-nail-game/index.wasm")
+          if wasm.read_bytes()[:4] != b"\x00asm":
+              raise SystemExit("Invalid WebAssembly output")
+          print(f"Verified {wasm} ({wasm.stat().st_size} bytes)")
+          PY
+
+      - name: Commit Web build to main
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- shadow-nail-game
+          if git diff --cached --quiet; then
+            echo "Web build is already up to date."
+          else
+            git commit -m "Publish Shadow Nail web game"
+            git push origin HEAD:main
+          fi
