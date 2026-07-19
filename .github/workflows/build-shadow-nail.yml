@@ -164,9 +164,14 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           wasm = Path("shadow-nail-game/index.wasm")
+          pck = Path("shadow-nail-game/index.pck")
           if wasm.read_bytes()[:4] != b"\x00asm":
               raise SystemExit("Invalid WebAssembly output")
+          # Godot 遇到资源路径错误时可能仍返回 0；过小的 PCK 通常意味着只导出了空壳。
+          if pck.stat().st_size < 100_000:
+              raise SystemExit(f"Resource pack is unexpectedly small: {pck.stat().st_size} bytes")
           print(f"Verified {wasm} ({wasm.stat().st_size} bytes)")
+          print(f"Verified {pck} ({pck.stat().st_size} bytes)")
           PY
 
       - name: Commit Web build to main
