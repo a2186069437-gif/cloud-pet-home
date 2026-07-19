@@ -32,7 +32,9 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/shadow-nail-source"
           cat .github/build-input/source.part* | base64 --decode > "$RUNNER_TEMP/shadow-nail-source.zip"
-          unzip -q "$RUNNER_TEMP/shadow-nail-source.zip" -d "$RUNNER_TEMP/shadow-nail-source"
+          # Info-ZIP 会把由 Windows 创建的合法 ZIP 警告为反斜杠路径并返回 1。
+          # Python 标准库能正确解压该归档，也不会把非致命警告误判成构建失败。
+          python3 -m zipfile -e "$RUNNER_TEMP/shadow-nail-source.zip" "$RUNNER_TEMP/shadow-nail-source"
           test -s "$RUNNER_TEMP/shadow-nail-source/project.godot"
           test -s "$RUNNER_TEMP/shadow-nail-source/export_presets.cfg"
 
